@@ -44,15 +44,15 @@ class ProcessTest extends \PHPUnit_Framework_TestCase {
     }
 
     public function testCommandCanRun() {
-        Loop::execute(function() {
+        Loop::execute(\Amp\wrap(function() {
             $process = new Process(self::CMD_PROCESS);
             $promise = $process->execute();
 
             $completed = false;
             $promise->when(function() use (&$completed) { $completed = true; });
             $this->assertFalse($completed);
-            $this->assertInternalType('int', $process->getPid());
-        });
+            $this->assertInternalType('int', yield $process->getPid());
+        }));
     }
 
     /**

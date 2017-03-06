@@ -30,8 +30,8 @@ class Process {
     /** @var resource|null */
     private $stderr;
 
-    /** @var int */
-    private $pid = 0;
+    /** @var \Amp\Deferred|int */
+    private $pid;
 
     /** @var int */
     private $oid = 0;
@@ -58,6 +58,8 @@ class Process {
         }
         $this->command = $command;
         $this->cwd = $cwd ?? "";
+
+        $this->pid = new Deferred;
 
         foreach ($env as $key => $value) {
             if (\is_array($value)) {
@@ -124,6 +126,7 @@ class Process {
         }
 
         $this->deferred = $deferred = new Deferred;
+        $promise = $deferred->promise();
 
         $fd = [
             ["pipe", "r"], // stdin
@@ -149,7 +152,10 @@ class Process {
             if ($error = \error_get_last()) {
                 $message .= \sprintf(" Errno: %d; %s", $error["type"], $error["message"]);
             }
-            throw new ProcessException($message);
+            $exception = new ProcessException($message);
+            $this->pid->fail($exception);
+            $this->deferred->fail($exception);
+            return $promise;
         }
 
         $this->oid = \getmypid();
@@ -158,10 +164,13 @@ class Process {
         if (!$status) {
             \proc_close($this->process);
             $this->process = null;
-            throw new ProcessException("Could not get process status");
+            $exception = new ProcessException("Could not get process status");
+            $this->pid->fail($exception);
+            $this->deferred->fail($exception);
+            return $promise;
         }
 
-        $this->pid = $status["pid"];
+        $this->running = true;
 
         foreach ($pipes as $pipe) {
             \stream_set_blocking($pipe, false);
@@ -170,44 +179,47 @@ class Process {
         $this->stdin = $stdin = $pipes[0];
         $this->stdout = $pipes[1];
         $this->stderr = $pipes[2];
+        $stream = $pipes[3];
 
-        $this->running = true;
-
-        $process = &$this->process;
         $running = &$this->running;
-        $this->watcher = Loop::onReadable($pipes[3], static function ($watcher, $resource) use (
-            &$process, &$running, $deferred, $stdin
-        ) {
-            Loop::cancel($watcher);
+        $promise->when(static function () use (&$running, $stream, $stdin) {
             $running = false;
-
-            try {
-                try {
-                    if (!\is_resource($resource) || \feof($resource)) {
-                        throw new ProcessException("Process ended unexpectedly");
-                    }
-                    $code = \rtrim(@\stream_get_contents($resource));
-                } finally {
-                    if (\is_resource($resource)) {
-                        \fclose($resource);
-                    }
-                    if (\is_resource($stdin)) {
-                        \fclose($stdin);
-                    }
-                }
-            } catch (\Throwable $exception) {
-                $deferred->fail($exception);
-                return;
+            if (\is_resource($stream)) {
+                \fclose($stream);
             }
-
-            if (\strncasecmp(\PHP_OS, "WIN", 3) === 0) {
-                $code = \proc_get_status($process)["exitcode"];
+            if (\is_resource($stdin)) {
+                \fclose($stdin);
             }
-
-            $deferred->resolve((int) $code);
         });
 
-        return $deferred->promise();
+        $pid = &$this->pid;
+        $this->watcher = Loop::onReadable($stream, static function ($watcher, $resource) use (&$pid, $deferred, $stdin) {
+            static $initial = true;
+
+            try {
+                if (!\is_resource($resource) || \feof($resource)) {
+                    throw new ProcessException("Process ended unexpectedly");
+                }
+
+                if ($initial) {
+                    $initial = false;
+                    $pid->resolve((int) \rtrim(@\fread($resource, 5))); // Two bytes written as string
+                    return;
+                }
+
+                Loop::cancel($watcher);
+
+                $deferred->resolve((int) \rtrim(@\fread($resource, 3))); // Single byte written as string
+            } catch (\Throwable $exception) {
+                Loop::cancel($watcher);
+                if ($initial) {
+                    $pid->fail($exception);
+                }
+                $deferred->fail($exception);
+            }
+        });
+
+        return $promise;
     }
 
     /**
@@ -244,16 +256,10 @@ class Process {
     /**
      * Returns the PID of the child process. Value is only meaningful if PHP was not compiled with --enable-sigchild.
      *
-     * @return int
-     *
-     * @throws \Amp\Process\StatusError
+     * @return \AsyncInterop\Promise<int>
      */
-    public function getPid(): int {
-        if ($this->pid === 0) {
-            throw new StatusError("The process has not been started");
-        }
-
-        return $this->pid;
+    public function getPid(): Promise {
+        return $this->pid->promise();
     }
 
     /**
